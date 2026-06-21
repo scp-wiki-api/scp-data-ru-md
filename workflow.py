@@ -2,13 +2,13 @@
 """
 SCP API → Markdown + Russian translation workflow.
 
-Fetches data from https://github.com/scp-data/scp-api via GitHub API,
-converts JSON entries to Markdown, translates to Russian with argostranslate,
-and writes output to ./output/.
+Two data-source modes:
+  --local-path PATH   Read from a pre-cloned scp-api repo (docs/data/scp/)
+  (no flag)           Download files via GitHub raw URLs (cached in ./cache/)
 
 Usage:
     python workflow.py [--section SECTION] [--limit N] [--no-translate]
-                       [--github-token TOKEN] [--workers N]
+                       [--local-path PATH] [--github-token TOKEN] [--workers N]
 
 Sections: items, tales, hubs, goi  (default: all)
 """
@@ -33,35 +33,41 @@ from tqdm import tqdm
 
 REPO = "scp-data/scp-api"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/main/docs/data/scp"
-API_BASE = "https://api.github.com"
 
 SECTIONS = {
     "items": {
-        "index": f"{RAW_BASE}/items/index.json",
-        "content_index": f"{RAW_BASE}/items/content_index.json",
-        "content_base": f"{RAW_BASE}/items/",
         "label": "Объект СЦП",
+        "remote": {
+            "index": f"{RAW_BASE}/items/index.json",
+            "content_index": f"{RAW_BASE}/items/content_index.json",
+            "content_base_url": f"{RAW_BASE}/items/",
+        },
+        "local": {
+            "index": Path("items/index.json"),
+            "content_index": Path("items/content_index.json"),
+            "content_dir": Path("items/"),
+        },
     },
     "tales": {
-        "index": f"{RAW_BASE}/tales/index.json",
         "label": "Рассказ",
+        "remote": {"index": f"{RAW_BASE}/tales/index.json"},
+        "local": {"index": Path("tales/index.json")},
     },
     "hubs": {
-        "index": f"{RAW_BASE}/hubs/index.json",
         "label": "Хаб",
+        "remote": {"index": f"{RAW_BASE}/hubs/index.json"},
+        "local": {"index": Path("hubs/index.json")},
     },
     "goi": {
-        "index": f"{RAW_BASE}/goi/index.json",
         "label": "Группа Интересов",
+        "remote": {"index": f"{RAW_BASE}/goi/index.json"},
+        "local": {"index": Path("goi/index.json")},
     },
 }
 
 OUTPUT_DIR = Path("output")
 CACHE_DIR = Path("cache")
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
-
-# Fields to translate (text-heavy, skip links/dates/ids)
-TRANSLATE_FIELDS = {"title", "raw_content"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -87,48 +93,61 @@ class GithubClient:
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
 
-    def get_json(self, url: str, **params) -> Any:
-        """GET JSON with automatic retry on rate-limit (429 / 403)."""
-        for attempt in range(5):
-            resp = self.session.get(url, params=params, timeout=60)
-            if resp.status_code in (429, 403):
-                reset = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
-                wait = max(reset - int(time.time()), 5)
-                log.warning("Rate limited — sleeping %ds", wait)
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        raise RuntimeError(f"Failed to fetch {url} after retries")
-
     def download_raw(self, url: str, dest: Path) -> Path:
-        """Download a potentially large raw file with streaming."""
+        """Download a potentially large raw file with streaming, cache on disk."""
         if dest.exists():
             log.debug("Cache hit: %s", dest.name)
             return dest
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".tmp")
         log.info("Downloading %s …", url.split("/")[-1])
-        with self.session.get(url, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            with open(tmp, "wb") as fh, tqdm(
-                total=total, unit="B", unit_scale=True,
-                desc=dest.name, leave=False
-            ) as bar:
-                for chunk in resp.iter_content(chunk_size=1 << 16):
-                    fh.write(chunk)
-                    bar.update(len(chunk))
-        tmp.rename(dest)
-        return dest
+        for attempt in range(5):
+            try:
+                with self.session.get(url, stream=True, timeout=120) as resp:
+                    if resp.status_code in (429, 403):
+                        reset = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
+                        wait = max(reset - int(time.time()), 5)
+                        log.warning("Rate limited — sleeping %ds", wait)
+                        time.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length", 0))
+                    with open(tmp, "wb") as fh, tqdm(
+                        total=total, unit="B", unit_scale=True,
+                        desc=dest.name, leave=False,
+                    ) as bar:
+                        for chunk in resp.iter_content(chunk_size=1 << 16):
+                            fh.write(chunk)
+                            bar.update(len(chunk))
+                tmp.rename(dest)
+                return dest
+            except requests.RequestException as exc:
+                log.warning("Download error (attempt %d): %s", attempt + 1, exc)
+                time.sleep(5)
+        raise RuntimeError(f"Failed to download {url} after retries")
 
-    def list_repo_tree(self, repo: str, branch: str = "main") -> list[dict]:
-        """Return flat list of all blobs in the repo tree (avoids recursive API limits)."""
-        data = self.get_json(
-            f"{API_BASE}/repos/{repo}/git/trees/{branch}",
-            recursive=1,
-        )
-        return data.get("tree", [])
+
+# ---------------------------------------------------------------------------
+# File resolution (local vs remote)
+# ---------------------------------------------------------------------------
+
+def resolve_json(
+    local_path: Optional[Path],
+    remote_url: str,
+    cache_path: Path,
+    client: GithubClient,
+) -> Path:
+    """Return a local filesystem path to the JSON file."""
+    if local_path is not None:
+        if not local_path.exists():
+            raise FileNotFoundError(f"Local file not found: {local_path}")
+        return local_path
+    return client.download_raw(remote_url, cache_path)
+
+
+def load_json(path: Path) -> Any:
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +172,11 @@ def _init_translator():
 
     from_code, to_code = "en", "ru"
 
-    # Check if the package is already installed
     installed = argostranslate.package.get_installed_packages()
     pkg = next(
         (p for p in installed if p.from_code == from_code and p.to_code == to_code),
         None,
     )
-
     if pkg is None:
         log.info("Downloading argostranslate en→ru package …")
         argostranslate.package.update_package_index()
@@ -179,26 +196,23 @@ def _init_translator():
 
 
 def translate_text(text: str) -> str:
-    """Translate a text block en→ru, returning original on failure."""
+    """Translate a text block en→ru paragraph by paragraph."""
     if not text or not text.strip():
         return text
     tr = _init_translator()
     if tr is None:
         return text
-
-    # Split into paragraphs to avoid hitting token limits per call
-    paragraphs = text.split("\n")
-    translated = []
-    for para in paragraphs:
+    result = []
+    for para in text.split("\n"):
         if para.strip():
             try:
-                translated.append(tr.translate(para))
+                result.append(tr.translate(para))
             except Exception as exc:
                 log.debug("Translation error: %s", exc)
-                translated.append(para)
+                result.append(para)
         else:
-            translated.append(para)
-    return "\n".join(translated)
+            result.append(para)
+    return "\n".join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +228,6 @@ def _safe_str(val: Any) -> str:
 
 
 def _clean_html(html: str) -> str:
-    """Strip HTML tags, preserve newlines from <br> / <p> / <div>."""
     html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
     html = re.sub(r"</p>|</div>|</li>", "\n", html, flags=re.I)
     html = re.sub(r"<[^>]+>", "", html)
@@ -222,14 +235,7 @@ def _clean_html(html: str) -> str:
     return html.strip()
 
 
-def item_to_markdown(
-    link: str,
-    data: dict,
-    section_label: str,
-    do_translate: bool,
-) -> str:
-    """Convert a single JSON entry to a Markdown document."""
-
+def item_to_markdown(link: str, data: dict, section_label: str, do_translate: bool) -> str:
     title = _safe_str(data.get("title") or data.get("scp") or link)
     scp_num = data.get("scp_number")
     rating = data.get("rating")
@@ -239,7 +245,6 @@ def item_to_markdown(
     created_by = data.get("created_by", "")
     series = data.get("series", "")
     images = data.get("images", [])
-
     raw_content = _clean_html(_safe_str(data.get("raw_content", "")))
 
     if do_translate:
@@ -250,12 +255,8 @@ def item_to_markdown(
         content_ru = raw_content
 
     lines: list[str] = []
-
-    # Header
     lines.append(f"# {title_ru}")
     lines.append("")
-
-    # Meta table
     lines.append("| Поле | Значение |")
     lines.append("|------|----------|")
     lines.append(f"| **Тип** | {section_label} |")
@@ -272,35 +273,25 @@ def item_to_markdown(
     if url:
         lines.append(f"| **Оригинал** | [{url}]({url}) |")
     lines.append("")
-
-    # Tags
     if tags:
-        tag_str = " ".join(f"`{t}`" for t in tags)
-        lines.append(f"**Теги:** {tag_str}")
+        lines.append("**Теги:** " + " ".join(f"`{t}`" for t in tags))
         lines.append("")
-
-    # Images
     if images:
         lines.append("## Изображения")
         lines.append("")
-        for img in images[:5]:  # cap at 5 to keep docs lean
+        for img in images[:5]:
             lines.append(f"![]({img})")
         lines.append("")
-
-    # Content
     if content_ru:
         lines.append("## Содержание")
         lines.append("")
         lines.append(content_ru)
         lines.append("")
-
-    # License footer
     lines.append("---")
     lines.append(
         "*Это переведённая копия материала с [SCP Wiki](http://www.scp-wiki.net/). "
         "Распространяется на условиях [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/).*"
     )
-
     return "\n".join(lines)
 
 
@@ -310,13 +301,23 @@ def item_to_markdown(
 
 def write_markdown(out_dir: Path, slug: str, content: str) -> None:
     filename = re.sub(r"[^\w\-]", "_", slug) + ".md"
-    path = out_dir / filename
-    path.write_text(content, encoding="utf-8")
+    (out_dir / filename).write_text(content, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
 # Section processing
 # ---------------------------------------------------------------------------
+
+def _process_entry(args: tuple) -> tuple[str, bool]:
+    link, data, label, do_translate, out_dir = args
+    try:
+        md = item_to_markdown(link, data, label, do_translate)
+        write_markdown(out_dir, link, md)
+        return link, True
+    except Exception as exc:
+        log.warning("Failed %s: %s", link, exc)
+        return link, False
+
 
 def process_section(
     section: str,
@@ -325,73 +326,91 @@ def process_section(
     do_translate: bool,
     limit: Optional[int],
     workers: int,
+    local_base: Optional[Path] = None,
 ) -> int:
-    """Download, convert, translate, and write all entries for a section."""
-
     out_dir = OUTPUT_DIR / section
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = CACHE_DIR / section
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     label = cfg["label"]
-    index_url = cfg["index"]
-    index_cache = cache_dir / "index.json"
+    local_cfg = cfg["local"]
+    remote_cfg = cfg["remote"]
 
-    # Download index
-    client.download_raw(index_url, index_cache)
-    log.info("[%s] Parsing index …", section)
-    with open(index_cache, encoding="utf-8") as fh:
-        index: dict = json.load(fh)
-
-    # For items: merge content from content files into index entries
-    if section == "items" and "content_index" in cfg:
-        content_index_cache = cache_dir / "content_index.json"
-        client.download_raw(cfg["content_index"], content_index_cache)
-        with open(content_index_cache, encoding="utf-8") as fh:
-            content_index: dict = json.load(fh)
-
-        content_map: dict[str, dict] = {}
-        for series_name, filename in content_index.items():
-            content_url = cfg["content_base"] + filename
-            content_cache = cache_dir / filename
-            client.download_raw(content_url, content_cache)
-            log.info("[%s] Parsing content file: %s …", section, filename)
-            with open(content_cache, encoding="utf-8") as fh:
-                series_data: dict = json.load(fh)
-            content_map.update(series_data)
-
-        # Merge raw_content into index entries
-        for link, entry in index.items():
-            if link in content_map:
-                entry["raw_content"] = content_map[link].get("raw_content", "")
-
-    entries = list(index.items())
-    if limit:
-        entries = entries[:limit]
-
-    log.info("[%s] Processing %d entries …", section, len(entries))
-
-    def _process(args: tuple) -> tuple[str, bool]:
-        link, data = args
-        try:
-            md = item_to_markdown(link, data, label, do_translate)
-            write_markdown(out_dir, link, md)
-            return link, True
-        except Exception as exc:
-            log.warning("[%s] Failed %s: %s", section, link, exc)
-            return link, False
+    index_path = resolve_json(
+        local_path=local_base / local_cfg["index"] if local_base else None,
+        remote_url=remote_cfg["index"],
+        cache_path=cache_dir / "index.json",
+        client=client,
+    )
+    log.info("[%s] Loading index …", section)
+    index: dict = load_json(index_path)
 
     success = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_process, e): e[0] for e in entries}
-        with tqdm(total=len(entries), desc=f"{section}", unit="art") as bar:
-            for fut in as_completed(futures):
-                _, ok = fut.result()
-                if ok:
-                    success += 1
-                bar.update(1)
 
-    log.info("[%s] Done: %d/%d written", section, success, len(entries))
+    if section == "items":
+        # Process per-series to avoid loading all content into memory at once
+        content_index_path = resolve_json(
+            local_path=local_base / local_cfg["content_index"] if local_base else None,
+            remote_url=remote_cfg["content_index"],
+            cache_path=cache_dir / "content_index.json",
+            client=client,
+        )
+        content_index: dict = load_json(content_index_path)
+
+        written = 0
+        for series_name, filename in content_index.items():
+            if limit and written >= limit:
+                break
+
+            local_file = (local_base / local_cfg["content_dir"] / filename) if local_base else None
+            content_path = resolve_json(
+                local_path=local_file,
+                remote_url=remote_cfg["content_base_url"] + filename,
+                cache_path=cache_dir / filename,
+                client=client,
+            )
+            log.info("[items] Loading series: %s …", series_name)
+            series_data: dict = load_json(content_path)
+
+            # Merge index metadata into content entries
+            entries = []
+            for link, content_entry in series_data.items():
+                if limit and written + len(entries) >= limit:
+                    break
+                meta = index.get(link, {})
+                merged = {**meta, **content_entry}
+                entries.append((link, merged, label, do_translate, out_dir))
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_process_entry, e): e[0] for e in entries}
+                with tqdm(total=len(entries), desc=f"items/{series_name}", unit="art") as bar:
+                    for fut in as_completed(futures):
+                        _, ok = fut.result()
+                        if ok:
+                            success += 1
+                        written += 1
+                        bar.update(1)
+
+            del series_data  # free memory before next series
+
+    else:
+        entries_raw = list(index.items())
+        if limit:
+            entries_raw = entries_raw[:limit]
+        entries = [(lnk, d, label, do_translate, out_dir) for lnk, d in entries_raw]
+
+        log.info("[%s] Processing %d entries …", section, len(entries))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_entry, e): e[0] for e in entries}
+            with tqdm(total=len(entries), desc=section, unit="art") as bar:
+                for fut in as_completed(futures):
+                    _, ok = fut.result()
+                    if ok:
+                        success += 1
+                    bar.update(1)
+
+    log.info("[%s] Done — %d written", section, success)
     return success
 
 
@@ -404,7 +423,6 @@ def write_readme(sections_done: dict[str, int]) -> None:
         f"| [{s}](output/{s}/) | {count} файлов |"
         for s, count in sections_done.items()
     )
-
     content = f"""\
 # SCP API — Markdown / Русский
 
@@ -422,35 +440,19 @@ def write_readme(sections_done: dict[str, int]) -> None:
 ## Использование
 
 ```bash
-# Установить зависимости
 pip install -r requirements.txt
 
-# Запустить полный workflow (все разделы)
-python workflow.py
+# Из локально склонированного репо
+python workflow.py --local-path scp-api/docs/data/scp
 
-# Только SCP-объекты, первые 100, без перевода
+# Через GitHub API (кэширует в cache/)
 python workflow.py --section items --limit 100 --no-translate
-
-# С GitHub токеном (увеличивает лимит API до 5000 req/h)
-python workflow.py --github-token ghp_xxxx
 ```
-
-## Опции
-
-| Флаг | Описание |
-|------|----------|
-| `--section` | Один из: `items`, `tales`, `hubs`, `goi` (по умолчанию — все) |
-| `--limit N` | Ограничить количество статей |
-| `--no-translate` | Пропустить перевод (только конвертация в Markdown) |
-| `--github-token` | Personal Access Token для GitHub API |
-| `--workers N` | Количество потоков (по умолчанию: 4) |
 
 ## Лицензия
 
-Весь контент SCP распространяется по лицензии
+Весь контент SCP Wiki распространяется по лицензии
 [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/) — см. [LICENSE](./LICENSE).
-
-Перевод является производным произведением и распространяется на тех же условиях.
 """
     Path("README.md").write_text(content, encoding="utf-8")
     log.info("README.md written.")
@@ -461,17 +463,22 @@ python workflow.py --github-token ghp_xxxx
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--section", choices=list(SECTIONS), default=None,
                    help="Process only this section (default: all)")
     p.add_argument("--limit", type=int, default=None,
                    help="Max articles per section")
     p.add_argument("--no-translate", action="store_true",
-                   help="Skip argostranslate translation step")
+                   help="Skip argostranslate — only convert JSON→Markdown")
+    p.add_argument("--local-path", type=Path, default=None, metavar="PATH",
+                   help="Path to docs/data/scp/ inside a cloned scp-api repo")
     p.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN"),
-                   help="GitHub Personal Access Token (or set GITHUB_TOKEN env var)")
+                   help="GitHub PAT for remote mode (or set GITHUB_TOKEN env var)")
     p.add_argument("--workers", type=int, default=4,
-                   help="Parallel translation/write workers (default: 4)")
+                   help="Parallel write workers (default: 4)")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
 
@@ -481,27 +488,36 @@ def main() -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    local_base: Optional[Path] = args.local_path
+    if local_base is not None:
+        if not local_base.is_dir():
+            log.error("--local-path does not exist: %s", local_base)
+            sys.exit(1)
+        log.info("Local mode: reading from %s", local_base)
+    else:
+        log.info("Remote mode: downloading via GitHub raw URLs")
+
     do_translate = not args.no_translate
-
-    client = GithubClient(token=args.github_token)
-
-    # Pre-init translator (downloads model once)
     if do_translate:
         log.info("Initialising argostranslate en→ru …")
         if _init_translator() is None:
             log.error("Translation unavailable. Re-run with --no-translate to skip.")
             sys.exit(1)
 
+    client = GithubClient(token=args.github_token)
     sections_to_run = {args.section: SECTIONS[args.section]} if args.section else SECTIONS
     results: dict[str, int] = {}
 
     for section, cfg in sections_to_run.items():
         try:
             count = process_section(
-                section, cfg, client,
+                section=section,
+                cfg=cfg,
+                client=client,
                 do_translate=do_translate,
                 limit=args.limit,
                 workers=args.workers,
+                local_base=local_base,
             )
             results[section] = count
         except Exception as exc:
@@ -509,10 +525,7 @@ def main() -> None:
             results[section] = 0
 
     write_readme(results)
-
-    total = sum(results.values())
-    log.info("All done. Total articles written: %d", total)
-    log.info("Output: %s/", OUTPUT_DIR)
+    log.info("Done. Total: %d articles. Output: %s/", sum(results.values()), OUTPUT_DIR)
 
 
 if __name__ == "__main__":

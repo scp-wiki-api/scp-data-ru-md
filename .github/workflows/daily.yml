@@ -1,0 +1,87 @@
+name: SCP Daily Translation
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # каждый день в 05:00 UTC
+  workflow_dispatch:        # ручной запуск через GitHub UI
+
+permissions:
+  contents: write           # нужно для git push в репо
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360    # до 6 часов (перевод большого датасета)
+
+    steps:
+      # ── 1. Checkout кода (ветка main) ────────────────────────────────────
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0    # полная история нужна для переключения веток
+
+      # ── 2. Sparse-clone scp-api (только docs/data/scp/) ──────────────────
+      #   Полное репо весит ~15 ГБ, sparse-checkout скачивает только нужное.
+      - name: Clone SCP API (sparse, shallow)
+        run: |
+          git clone \
+            --depth 1 \
+            --filter=blob:none \
+            --sparse \
+            https://github.com/scp-data/scp-api.git scp-api-data
+          cd scp-api-data
+          git sparse-checkout set docs/data/scp
+
+      # ── 3. Python + кэш pip ──────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Кэш модели argostranslate между запусками ─────────────────────
+      - name: Cache argostranslate model
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argostranslate-en-ru-v1
+
+      # ── 5. Запуск workflow ────────────────────────────────────────────────
+      - name: Run translation workflow
+        run: |
+          python workflow.py \
+            --local-path scp-api-data/docs/data/scp \
+            --workers 4
+        env:
+          PYTHONUNBUFFERED: "1"
+
+      # ── 6. Публикация результата в ветку translations ────────────────────
+      - name: Commit and push to translations branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Переключаемся в ветку translations (создаём если нет)
+          git checkout -B translations
+
+          # Добавляем output/, игнорируя .gitignore
+          git add -f output/ README.md
+
+          # Коммитим только если есть изменения
+          if git diff --cached --quiet; then
+            echo "No changes — skipping commit."
+          else
+            DATE=$(date -u +%Y-%m-%d)
+            COUNT=$(find output -name '*.md' | wc -l)
+            git commit -m "chore: daily translation ${DATE} (${COUNT} articles)"
+            git push origin translations --force
+          fi
+
+      # ── 7. Удаляем клон (освобождаем место) ──────────────────────────────
+      - name: Cleanup SCP API clone
+        if: always()
+        run: rm -rf scp-api-data
