@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({k: d.get\\(k\\) for k in ['name','description','default_branch','size','language','topics','license']}, indent=2, ensure_ascii=False\\)\\)\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/\")",
+      "Bash(python3 -c \"import json,sys; items=json.load\\(sys.stdin\\); [print\\(f'{i[\\\\\"type\\\\\"]}\\\\t{i[\\\\\"name\\\\\"]}'\\) for i in items]\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/docs\")",
+      "Bash(python3 -c \"import json,sys; items=json.load\\(sys.stdin\\); [print\\(f'{i[\\\\\"type\\\\\"]}\\\\t{i[\\\\\"name\\\\\"]}\\\\t{i.get\\(\\\\\"size\\\\\",0\\)}'\\) for i in items[:30]]\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/bin\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/docs/data\")",
+      "Bash(python3 -c \"import json,sys; items=json.load\\(sys.stdin\\); [print\\(f'{i[\\\\\"type\\\\\"]}\\\\t{i[\\\\\"name\\\\\"]}'\\) for i in items[:40]]\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/scp-data/scp-api/main/docs/README.md\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/docs/data/scp\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/scp-data/scp-api/main/README.md\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/docs/data/scp/items\")",
+      "Bash(python3 -c \"import json,sys; items=json.load\\(sys.stdin\\); [print\\(f'{i[\\\\\"type\\\\\"]}\\\\t{i[\\\\\"name\\\\\"]}\\\\t{i.get\\(\\\\\"size\\\\\",0\\)}'\\) for i in items]\")",
+      "Bash(curl -s \"https://api.github.com/repos/scp-data/scp-api/contents/.github/workflow)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('workflow.py'\\).read\\(\\)\\); print\\('OK — синтаксических ошибок нет'\\)\")"
+    ]
+  }
+}

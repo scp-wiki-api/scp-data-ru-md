@@ -1,0 +1,4 @@
+requests>=2.31.0
+argostranslate>=1.9.6
+ijson>=3.2.3
+tqdm>=4.66.0
